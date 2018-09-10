@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"log-tracker/tracker"
 	"os"
 	"os/exec"
 
@@ -12,9 +16,9 @@ import (
 )
 
 var (
-	cfgFile       string
-	filepathArg   string
-	numberOfLines int
+	cfgFile, filepathArg string
+	stdinLogs            bool
+	numberOfLines        int
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -75,15 +79,26 @@ func initConfig() {
 }
 
 func rootPreRunE(cmd *cobra.Command, args []string) error {
-	if _, err := exec.Command("tail").Output(); err != nil {
-		if cmdErr, ok := err.(*exec.Error); ok {
-			log.Println("valid tail command found on current system")
-			return cmdErr
-		}
-	}
-	if err := checkFilePath(args); err != nil {
+	stat, err := os.Stdin.Stat()
+	if err != nil {
 		return err
 	}
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		stdinLogs = true
+		fmt.Println("data is being piped to stdin")
+	}
+
+	if err := checkFilePath(args); err != nil && stdinLogs == false {
+		return err
+	} else if err == nil {
+		if _, err := exec.Command("tail").Output(); err != nil {
+			if cmdErr, ok := err.(*exec.Error); ok {
+				log.Println("valid tail command found on current system")
+				return cmdErr
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -95,8 +110,9 @@ func checkFilePath(args []string) error {
 		}
 		return fmt.Errorf("('%s') is not a valid filepath", args[0])
 	}
-	if filepathArg != "" {
-		if _, err := os.Stat(filepathArg); err == nil {
+	if filepathString := viper.GetString("filepath"); filepathString != "" {
+		if _, err := os.Stat(filepathString); err == nil {
+			filepathArg = filepathString
 			return nil
 		}
 		return fmt.Errorf("('%s') is not a valid filepath", filepathArg)
@@ -105,23 +121,29 @@ func checkFilePath(args []string) error {
 }
 
 func rootRunE(cmd *cobra.Command, args []string) error {
+	if stdinLogs {
+
+	}
 	follow := viper.GetBool("follow")
 
 	tailCmdStringArgs := buildTailCommandArgs(follow, numberOfLines, filepathArg)
 	tailCmd := exec.Command("tail", tailCmdStringArgs...)
-	if follow {
-		log.Println("Beginning follow mode")
-		err := followMode(tailCmd)
-		if err != nil {
-			return err
-		}
-	} else {
-		log.Println("Logging default amount")
-		err := standardMode(tailCmd)
-		if err != nil {
-			return err
+	if filepathArg != "" {
+		if follow {
+			log.Println("Beginning follow mode")
+			err := followMode(tailCmd)
+			if err != nil {
+				return err
+			}
+		} else {
+			log.Println("Logging default amount")
+			err := standardMode(tailCmd)
+			if err != nil {
+				return err
+			}
 		}
 	}
+
 	return nil
 }
 
@@ -139,12 +161,28 @@ func followMode(tailCmd *exec.Cmd) error {
 	if err != nil {
 		return err
 	}
-	_, err = tailCmd.StdoutPipe()
+	stdout, err := tailCmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
-
 	err = tailCmd.Start()
+	if err != nil {
+		return err
+	}
+	stdoutLogger := tracker.Logger{
+		Logger: stdout,
+		LoggerKey: &tracker.LoggerKey{
+			Id:   "1",
+			Name: "bitbucket-stats",
+		},
+	}
+	logTracker, err := tracker.NewLogTracker([]tracker.Logger{stdoutLogger})
+	if err != nil {
+		return err
+	}
+	stop := logTracker.Start()
+	err = tailCmd.Wait()
+	stop()
 	if err != nil {
 		return err
 	}
@@ -158,4 +196,27 @@ func standardMode(tailCmd *exec.Cmd) error {
 	}
 	fmt.Println(string(out))
 	return nil
+}
+
+func stdoutWriterCollector(ctx context.Context, stdouts []io.ReadCloser) {
+	logChan := make(chan string)
+	for _, val := range stdouts {
+		go stdoutWriter(val, logChan)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case val := <-logChan:
+			fmt.Println(val)
+		}
+	}
+}
+
+func stdoutWriter(stdout io.ReadCloser, logChan chan string) {
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		logChan <- scanner.Text()
+	}
 }
